@@ -1,0 +1,187 @@
+This is *excellent* data — it basically nails the story.
+
+## What your results say (in plain English)
+
+### 1) HATX is both the victim **and** the holder — and it’s huge
+
+From your “role” query:
+
+* **VICTIM HATX = 29,192**
+* **HOLDER HATX = 22,548**
+* **HOLDER AISH = 6,650**
+* **VICTIM AISH = 1**
+
+So **AISH is mostly blocking others** (and almost never timing out itself), while **HATX is heavily contended and timing out a lot**, and also blocks others.
+
+That’s a classic “convoy / hot spot” pattern: many concurrent HATX units of work collide on the same thing; some become blockers while others time out.
+
+### 2) The lock type is overwhelmingly **DATA PAGE LOCK**
+
+Your grouped output shows nearly everything is **DATA PAGE LOCK**.
+
+So this is not primarily “GBP-DEP conversion lock” or “open lock” — it’s **row/page level contention** on one (or two) hot objects.
+
+### 3) The hot objects are basically two OBIDs
+
+Your “top objects” query:
+
+* `VICT_DBID = BHXUA01`, `VICT_OBID = 1794` → **15,140** timeouts
+* `VICT_DBID = BHXUA01`, `VICT_OBID = 1787` → **14,054** timeouts
+
+Everything else is noise.
+
+This strongly suggests:
+
+* two tables (or indexes, but OBID in your schema likely maps to table OBID) are the hotspots
+* they’re in the same database (`BHXUA01`) and hammered by HATX/AISH.
+
+### 4) Your top pair list shows “HATX blocks HATX”, same plan
+
+In the first query output, top rows are basically:
+
+* `VICT_CORR = HATX`
+* `HOLD_CORR_ID = HATX`
+* `VICT_PLAN = HOLD_PLAN = BHXUA010`
+* Lock = DATA PAGE LOCK
+
+So **HATX transactions are colliding with other HATX transactions** in the *same plan* on data pages (not some random unrelated holder). That’s the smoking gun for an application hot row/hot page.
+
+---
+
+# What to do next — concrete investigation steps
+
+## Step 1 — Map DBID/OBID to the real table names
+
+Do this first. With the table names you can talk to the app team meaningfully.
+
+Try:
+
+```sql
+SELECT DBID, OBID, CREATOR, NAME AS TABLE_NAME, TSNAME
+FROM SYSIBM.SYSTABLES
+WHERE DBID = (SELECT DISTINCT VICT_DBID FROM D2PD2B0.DPM_TIMEOUT
+              WHERE VICT_DBID = 'BHXUA01' FETCH FIRST 1 ROW ONLY)
+  AND OBID IN (1787, 1794)
+WITH UR;
+```
+
+If `DBID` in your `DPM_TIMEOUT` is *not numeric* (it looks like a DBNAME-ish token), then you may need to join via DBNAME instead. In that case, use your **DBNAME** from tablespace/table catalog (or pull DBNAME another way). If `SYSIBM.SYSTABLES.DBID` is numeric (usual), then your DPM column isn’t the numeric DBID — it’s likely a *DBNAME/identifier*. So, alternative mapping:
+
+1. Find the DBNAME for that “BHXUA01” in your environment (sometimes it literally is DBNAME).
+2. Then:
+
+```sql
+SELECT CREATOR, NAME AS TABLE_NAME, TSNAME
+FROM SYSIBM.SYSTABLES
+WHERE DBNAME = 'BHXUA01'
+  AND OBID IN (1787,1794)
+WITH UR;
+```
+
+(Use whichever column exists at your catalog level; some shops expose DBNAME via SYSTABLES/SYSTABLESPACE differently.)
+
+If you paste me the **DESCRIBE of SYSIBM.SYSTABLES** in your shop (just the columns around DBID/DBNAME/OBID), I’ll give you the exact join.
+
+## Step 2 — Confirm it’s one hot key / page (not general scans)
+
+Once you know the table(s), check if the workload is doing updates/inserts like:
+
+* “update same customer/account row”
+* “insert into a small ‘status’/counter table”
+* “select for update where key = constant”
+* “sequence-like table (homegrown)”
+* “work queue head row updated by many threads”
+
+**If it’s one or few keys:** you’ll see HATX↔HATX page lock timeouts, exactly like now.
+
+## Step 3 — Identify the holder duration pattern (long UOW / missing commits)
+
+You have `VICT_INSTANCE` and `HOLD_INSTANCE`. Use them to see whether the **same holder instance** causes many timeouts (long UOW), or whether it’s “many short holders” (pure concurrency/hotspot).
+
+Example:
+
+```sql
+SELECT HOLD_INSTANCE, HOLD_CORR_ID, HOLD_PLAN,
+       COUNT(*) AS TIMEOUTS_CAUSED
+FROM   D2PD2B0.DPM_TIMEOUT
+WHERE  VICT_TS >= '2026-01-19-00.00.00.000000'
+  AND  VICT_CORR = 'HATX'
+  AND  HOLD_CORR_ID IN ('HATX','AISH')
+GROUP BY HOLD_INSTANCE, HOLD_CORR_ID, HOLD_PLAN
+ORDER BY TIMEOUTS_CAUSED DESC
+FETCH FIRST 20 ROWS ONLY
+WITH UR;
+```
+
+Interpretation:
+
+* If **a few HOLD_INSTANCE values dominate** → you likely have **stuck/slow/long UOW holders**.
+* If it’s **spread across many instances** → it’s **pure hotspot contention** (too many concurrent updates to same page(s)).
+
+## Step 4 — If it’s hotspot contention, typical fixes (what to look for)
+
+Because it’s **DATA PAGE LOCK**, the usual levers are:
+
+### App / SQL behavior
+
+* **Commit more frequently** (shorter UOW) — often the single biggest improvement.
+* Avoid “read then update” patterns that hold locks longer than necessary.
+* Ensure **index access** is selective; table space scans under CS/RS can hold locks longer and touch more pages.
+
+### Data design (hot page/hot row)
+
+* If inserts are hitting the same page (bad clustering / monotonically increasing key):
+
+  * consider **partitioning**, **hash key**, or **randomizing insert key**
+  * adjust clustering/index design
+* If updates hit the same row (counter/status row):
+
+  * redesign to avoid single-row serialization (use atomic increment, sequence, separate rows per worker, etc.)
+
+### Db2 settings (secondary)
+
+* `IRLMRWT` only changes when you give up — it doesn’t fix contention.
+* Lock avoidance/isolation tweaks can help, but only after you confirm the access path and lock duration.
+
+## Step 5 — Cross-check with DSNT376I
+
+Grab 2–3 DSNT376I messages for the peak timeouts and validate they align:
+
+* requester CORRID = HATX
+* holder CORRID = HATX or AISH
+* resource maps to those OBIDs/tablespaces
+
+That ties log flooding directly to the same hotspot your DPM tables show.
+
+---
+
+# One important note about your “top 50 pairs” output
+
+Every row showing `CNT = 12` is because you grouped by **both instances** and plans — so it’s counting “per specific victim instance + holder instance pair”. Don’t read “12” as “only 12 timeouts” — it’s “12 for that exact pair”.
+
+To see the *real top pair totals*, group less:
+
+```sql
+SELECT VICT_CORR, HOLD_CORR_ID, VICT_PLAN, HOLD_PLAN, VICT_LOCK_RES,
+       COUNT(*) CNT
+FROM   D2PD2B0.DPM_TIMEOUT
+WHERE  VICT_TS >= '2026-01-19-00.00.00.000000'
+  AND (VICT_CORR IN ('HATX','AISH') OR HOLD_CORR_ID IN ('HATX','AISH'))
+GROUP BY VICT_CORR, HOLD_CORR_ID, VICT_PLAN, HOLD_PLAN, VICT_LOCK_RES
+ORDER BY CNT DESC
+FETCH FIRST 20 ROWS ONLY
+WITH UR;
+```
+
+---
+
+## If you do just one more thing now
+
+Run the “holder dominance” query (Step 3) and paste the top 20.
+
+With that, I can tell you immediately which camp you’re in:
+
+* **long-running holders** (few HOLD_INSTANCE dominate) → hunt those threads (CICS task, program loop, missing commit, I/O stall).
+* **distributed hotspot** (many holders) → it’s design/concurrency; fix needs app/data change or workload throttling/serialization.
+
+And in parallel, map **OBID 1787 & 1794** to real tables — that’s what your app team will need.
