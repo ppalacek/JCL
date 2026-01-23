@@ -1,0 +1,91 @@
+That’s actually very informative: **`BHXUA01` is not a Db2 database name** (i.e., not a row in `SYSIBM.SYSDATABASE.NAME`). So your `VICT_DBID` column is **not** “DBNAME”, and it’s also not the numeric `DBID` from the catalog.
+
+In other words, `VICT_DBID` in `DPM_TIMEOUT` is some **other identifier** (very often a *tablespace/DB token*, *resource name*, *internal id*, or a *derived label* used by the PE/DPM extractor).
+
+### What to do next (no guessing, just verify)
+
+## 1) Find the *data type* and length of `VICT_DBID`
+
+Run:
+
+```sql
+SELECT COLTYPE, LENGTH, SCALE
+FROM SYSIBM.SYSCOLUMNS
+WHERE TBCREATOR='D2PD2B0'
+  AND TBNAME='DPM_TIMEOUT'
+  AND COLNAME='VICT_DBID'
+WITH UR;
+```
+
+This tells us whether it’s CHAR/VARCHAR vs INTEGER, etc.
+
+## 2) See what `VICT_DBID` actually looks like in real rows
+
+Grab a quick sample:
+
+```sql
+SELECT VICT_DBID, COUNT(*) CNT
+FROM D2PD2B0.DPM_TIMEOUT
+WHERE VICT_TS >= '2026-01-19-00.00.00.000000'
+  AND (VICT_CORR IN ('HATX','AISH') OR HOLD_CORR_ID IN ('HATX','AISH'))
+GROUP BY VICT_DBID
+ORDER BY CNT DESC
+FETCH FIRST 20 ROWS ONLY
+WITH UR;
+```
+
+If you see values like `BHXUA01`, `ESPEU02`, `283`, etc. (you did), that’s a mix of **character tokens and numeric-looking tokens**, which is a strong hint it’s a *resource label*, not a catalog DBID.
+
+## 3) Use the column that *can* map to catalog: `VICT_RES_ID`
+
+You have a column named **`VICT_RES_ID`** in your header list. In many PE/DPM timeout tables, `*_RES_ID` is the piece that lets you decode the object (sometimes it’s OBID, sometimes it’s a composite).
+
+Do this:
+
+```sql
+SELECT VICT_RES_ID, VICT_DBID, VICT_OBID, VICT_LOCK_RES, COUNT(*) CNT
+FROM   D2PD2B0.DPM_TIMEOUT
+WHERE  VICT_TS >= '2026-01-19-00.00.00.000000'
+  AND (VICT_CORR IN ('HATX','AISH') OR HOLD_CORR_ID IN ('HATX','AISH'))
+GROUP BY VICT_RES_ID, VICT_DBID, VICT_OBID, VICT_LOCK_RES
+ORDER BY CNT DESC
+FETCH FIRST 30 ROWS ONLY
+WITH UR;
+```
+
+Then we can tell what the `RES_ID` format is (often it embeds DBID/PSID or page numbers).
+
+---
+
+# A practical workaround that often works immediately
+
+Even if we can’t decode `VICT_DBID` yet, **`VICT_OBID` is still gold**.
+
+Instead of trying to match DBID+OBID, try matching **OBID alone** (it can collide across DBIDs, but you’ll still likely get a tiny set of candidates, especially with two OBIDs):
+
+```sql
+SELECT CREATOR, NAME AS TABLE_NAME, TSNAME, DBID, OBID
+FROM SYSIBM.SYSTABLES
+WHERE OBID IN (1787, 1794)
+ORDER BY DBID, CREATOR, NAME
+WITH UR;
+```
+
+Then compare the returned DBIDs/tables to what your app uses. In many subsystems, OBIDs are unique enough that this already identifies the tables.
+
+If that returns “too many rows”, narrow it by also filtering on **tablespace** once you know it (sometimes `VICT_RES_ID` helps, or your deadlock table has PSID).
+
+---
+
+# Why you got 0 rows in SYSDATABASE
+
+Because `BHXUA01` / `ESPEU02` look like **application naming**, not Db2 database names. Db2 database names are usually 1–8 chars, yes, but they’d still appear in `SYSDATABASE` if they were real DBNAMEs.
+
+---
+
+If you paste:
+
+1. the output of the **SYSCOLUMNS** datatype query for `VICT_DBID`, and
+2. the top ~10 rows of the `VICT_RES_ID / VICT_DBID / VICT_OBID` grouping,
+
+…I can tell you exactly how to decode what PE stored and how to map it back to *real* Db2 objects.
