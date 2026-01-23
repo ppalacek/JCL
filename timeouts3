@@ -1,0 +1,181 @@
+Great — this is exactly the kind of output that lets us conclude something solid.
+
+## What you’ve learned from this output
+
+### 1) The lock flood is **page contention on a small number of pages**
+
+In your `VICT_RES_ID` breakdown, the top few values dominate:
+
+* `X'00040900'` (OBID 1787) → **12,694**
+* `X'0000AC00'` (OBID 1794) → **8,062**
+* `X'00075100'` (OBID 1787) → **4,843**
+* `X'0000B000'` (OBID 1794) → **4,123**
+* `X'00005900'` (OBID 1794) → **3,871**
+  …then it drops off sharply.
+
+That pattern is the hallmark of **“hot page(s)”** rather than “general table contention”. Lots of concurrent updates are hammering the *same few pages*, so you get massive **DATA PAGE LOCK** timeouts.
+
+So “rogue data” isn’t the right mental model — this looks like **normal application workload** concentrating on a hotspot.
+
+### 2) `VICT_DBID` like `BHXUA01` is not the catalog DBID
+
+Your catalog query on `OBID IN (1787,1794)` returned multiple candidate tables/tablespaces (because OBIDs aren’t globally unique across every DBID), and the numeric DBIDs shown there are things like **394/395/562/4003/5212** — none of which is `BHXUA01`.
+
+So treat `VICT_DBID` as a **label that PE/DPM uses**, not directly joinable to `SYSIBM.SYSTABLES.DBID`.
+
+### 3) You *can still map the real objects* — you just need one more discriminator
+
+Right now, `OBID` alone gives multiple candidates:
+
+* For OBID **1794** you see tables like `CUD_IP_PRFL_H`, `XRTESB`, etc (different creators)
+* For OBID **1787** you see tables like `CUD_CMPG_LST`, `XRTESC`, etc
+
+But in your timeout table you also have **`VICT_RES_ID`**, and it’s clearly meaningful (same RES_ID repeats thousands of times). That’s the missing piece.
+
+---
+
+## What is `VICT_RES_ID` likely to be?
+
+Given:
+
+* it’s hex,
+* and the same value repeats massively,
+* and lock type is DATA PAGE LOCK,
+
+`VICT_RES_ID` is very likely encoding the **page identifier** (or a page-set + page number) within the object.
+
+That’s why only a handful of values dominate: **a few pages are “hot”**.
+
+---
+
+# The fastest way to identify the real table/tablespace
+
+## Step 1 — Determine if the hotspots are mainly OBID 1787 or 1794 (you already have)
+
+You basically have two hotspots, both huge.
+
+Now you need to map **OBID → (DBID, PSID / TSNAME)** reliably.
+
+## Step 2 — Pull *tablespace name* directly from the timeout rows (if available)
+
+In many PE/DPM schemas, for page locks you’ll have either:
+
+* `VICT_TSNAME` / `VICT_DBNAME`
+* or `VICT_RES_DBID` / `VICT_RES_PSID`
+* or additional columns not shown in your snippet.
+
+From your earlier column header screenshot, I saw `VICT_RES_ID`, `VICT_OBID`, and `VICT_DBID`, but not PSID. If you have any of these columns, we can map instantly.
+
+Run this to list all columns that look like they describe the resource:
+
+```sql
+SELECT COLNAME
+FROM SYSIBM.SYSCOLUMNS
+WHERE TBCREATOR='D2PD2B0'
+  AND TBNAME='DPM_TIMEOUT'
+  AND (COLNAME LIKE '%PSID%' OR COLNAME LIKE '%TS%' OR COLNAME LIKE '%DBNAME%' OR COLNAME LIKE '%RES%')
+ORDER BY COLNO
+WITH UR;
+```
+
+If you see something like `VICT_PSID`, `VICT_RES_PSID`, `VICT_TSNAME`, `VICT_DBNAME`, etc — we’re done.
+
+## Step 3 — If there is **no PSID/TSNAME**, use the “candidate tables” list + application knowledge
+
+Right now you have candidate tablespaces:
+
+* For **OBID 1794**: TSNAME `CUD672`, `CUD187`, `XINS347` …
+* For **OBID 1787**: TSNAME `CUD151`, `XINS346` …
+
+This already hints you might be dealing with two different *application areas*:
+
+* `CUD*` looks like a customer domain
+* `XINS*` looks like another subsystem/domain
+
+So the next discriminators are:
+
+* which plan/package (`BHXUA010`) belongs to which app
+* which creator schema is used by that plan
+* whether HATX/AISH are known to touch the “CUD*” tables
+
+---
+
+# How to investigate HATX/AISH specifically (now that we know it’s hot pages)
+
+### A) Are HATX and AISH contending on the same hotspot pages?
+
+Run per-RES_ID breakdown by CORR:
+
+```sql
+SELECT VICT_CORR,
+       VICT_OBID,
+       VICT_RES_ID,
+       COUNT(*) AS CNT
+FROM   D2PD2B0.DPM_TIMEOUT
+WHERE  VICT_TS >= '2026-01-19-00.00.00.000000'
+  AND  VICT_CORR IN ('HATX','AISH')
+GROUP BY VICT_CORR, VICT_OBID, VICT_RES_ID
+ORDER BY CNT DESC
+FETCH FIRST 30 ROWS ONLY
+WITH UR;
+```
+
+If HATX dominates the top RES_IDs and AISH doesn’t, then AISH is “blocking elsewhere” and only occasionally intersects.
+If both hit the same top RES_IDs, they’re competing on the same hot pages.
+
+### B) Is it “few long holders” or “many short holders”?
+
+This tells you whether you chase **stuck threads** or **design hotspot**:
+
+```sql
+SELECT HOLD_CORR_ID, HOLD_INSTANCE, COUNT(*) AS CNT
+FROM   D2PD2B0.DPM_TIMEOUT
+WHERE  VICT_TS >= '2026-01-19-00.00.00.000000'
+  AND  VICT_CORR = 'HATX'
+GROUP BY HOLD_CORR_ID, HOLD_INSTANCE
+ORDER BY CNT DESC
+FETCH FIRST 20 ROWS ONLY
+WITH UR;
+```
+
+* If top 1–3 HOLD_INSTANCE values cause a huge chunk → find those threads (long UOW, missing commits, waits).
+* If it’s spread across many HOLD_INSTANCE values → classic hotspot contention; fix is **app/data design or throttling**, not “kill one holder”.
+
+### C) Confirm it’s the same plan/package and member(s)
+
+Add member if you have it (you showed `HOLD_SSID`, but not member in the columns you pasted). If there is `*_MEMBER` in the table, include it — data sharing can worsen hotspot effects.
+
+---
+
+# What fixes usually work for “hot data page lock” floods
+
+Once you identify the table(s), these are the common wins:
+
+1. **Reduce lock hold time**
+
+   * commit more often
+   * avoid “read then update later” patterns
+   * ensure no unnecessary scans under locking isolation
+
+2. **Remove the single hot row/page**
+
+   * if it’s a counter/status row: redesign to avoid single-row serialization
+   * if it’s inserts on monotonically increasing keys: partition / change clustering / randomize key / use hash-organized approach
+
+3. **Index/access path**
+
+   * missing/poor index can cause touching many pages → more locks and longer duration
+
+4. **Workload control**
+
+   * cap concurrency for that tran while you fix root cause (CICS transaction class/max active, app throttling, routing affinity)
+
+---
+
+## One very important note
+
+Your ability to map OBID→table is currently ambiguous *only because OBID repeats across DBIDs*. That’s normal.
+
+The easiest “tie-breaker” is: **find the TSNAME/DBID (numeric) from the timeout row** (PSID or TSNAME column), or use PE panels that display the object name for a selected event.
+
+If you run that `SYSCOLUMNS` “resource columns” query and paste the result, I’ll give you the exact join SQL to land on the precise table/tablespace, and then we can talk very concretely about what HATX/AISH are doing to it.
